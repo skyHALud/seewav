@@ -123,12 +123,12 @@ def load_bg_image(path, size):
     return bgra.tobytes()
 
 
-def draw_env(envs, out, fg_colors, bg_color, size, bg_image=None):
+def draw_env(envs, fg_colors, bg_color, size, bg_image=None):
     """
-    Internal function, draw a single frame (two frames for stereo) using cairo and save
-    it to the `out` file as png. envs is a list of envelopes over channels, each env
-    is a float[bars] representing the height of the envelope to draw. Each entry will
-    be represented by a bar. If `bg_image` is a bytes object (pre-serialized BGRA pixels
+    Internal function, draw a single frame (two frames for stereo) using cairo and return
+    the raw BGRA pixel data as a memoryview. envs is a list of envelopes over channels,
+    each env is a float[bars] representing the height of the envelope to draw. Each entry
+    will be represented by a bar. If `bg_image` is a bytes object (pre-serialized BGRA pixels
     from load_bg_image) it is used to initialize the surface in a single copy; otherwise
     the solid `bg_color` is used.
     """
@@ -152,7 +152,7 @@ def draw_env(envs, out, fg_colors, bg_color, size, bg_image=None):
     ctx.scale(*size)
 
     K = len(envs) # Number of waves to draw (waves are stacked vertically)
-    T = len(envs[0]) # Numbert of time steps
+    T = len(envs[0]) # Number of time steps
     pad_ratio = 0.1 # spacing ratio between 2 bars
     width = 1. / (T * (1 + 2 * pad_ratio))
     pad = pad_ratio * width
@@ -173,7 +173,7 @@ def draw_env(envs, out, fg_colors, bg_color, size, bg_image=None):
             ctx.line_to(pad + step * delta, midrule + 0.9 * half)
             ctx.stroke()
 
-    surface.write_to_png(out)
+    return surface.get_data()
 
 
 def interpole(x1, y1, x2, y2, x):
@@ -254,6 +254,27 @@ def visualize(audio,
     frames = int(rate * duration)
     smooth = np.hanning(bars)
 
+    # Start a single ffmpeg process that reads raw BGRA frames from stdin.
+    # This eliminates per-frame PNG encoding/writing/reading entirely.
+    video_input_cmd = [
+        "ffmpeg", "-y", "-loglevel", "panic",
+        "-f", "rawvideo", "-pix_fmt", "bgra",
+        "-s", f"{size[0]}x{size[1]}",
+        "-r", str(rate),
+        "-i", "pipe:0",
+    ]
+    audio_cmd = []
+    if seek is not None:
+        audio_cmd += ["-ss", str(seek)]
+    audio_cmd += ["-i", str(audio.resolve())]
+    audio_cmd += ["-t", str(duration)]
+    encode_cmd = [
+        "-c:a", "aac", "-vcodec", "libx264", "-crf", "10", "-pix_fmt", "yuv420p",
+        str(out.resolve()),
+    ]
+    ffmpeg_proc = sp.Popen(
+        video_input_cmd + audio_cmd + encode_cmd, stdin=sp.PIPE)
+
     print("Generating the frames...")
     for idx in tqdm.tqdm(range(frames), unit=" frames", ncols=80):
         pos = (((idx / rate)) * sr) / stride / bars
@@ -271,26 +292,14 @@ def visualize(audio,
             denv = (1 - w) * env1 + w * env2
             denv *= smooth
             denvs.append(denv)
-        draw_env(denvs, tmp / f"{idx:06d}.png", (fg_color, fg_color2), bg_color, size,
-                 bg_image=bg_pixel_data)
+        frame_data = draw_env(denvs, (fg_color, fg_color2), bg_color, size,
+                              bg_image=bg_pixel_data)
+        ffmpeg_proc.stdin.write(frame_data)
 
-    audio_cmd = []
-    if seek is not None:
-        audio_cmd += ["-ss", str(seek)]
-    audio_cmd += ["-i", audio.resolve()]
-    if duration is not None:
-        audio_cmd += ["-t", str(duration)]
-    print("Encoding the animation video... ")
-    # https://hamelot.io/visualization/using-ffmpeg-to-convert-a-set-of-images-into-a-video/
-    sp.run([
-        "ffmpeg", "-y", "-loglevel", "panic", "-r",
-        str(rate), "-f", "image2", "-s", f"{size[0]}x{size[1]}", "-i", "%06d.png"
-    ] + audio_cmd + [
-        "-c:a", "aac", "-vcodec", "libx264", "-crf", "10", "-pix_fmt", "yuv420p",
-        out.resolve()
-    ],
-           check=True,
-           cwd=tmp)
+    ffmpeg_proc.stdin.close()
+    retcode = ffmpeg_proc.wait()
+    if retcode:
+        raise sp.CalledProcessError(retcode, ffmpeg_proc.args)
 
 
 def parse_color(colorstr):
