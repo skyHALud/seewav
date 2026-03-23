@@ -111,15 +111,16 @@ def envelope(wav, window, stride):
 def load_bg_image(path, size):
     """
     Load a background image from `path`, resize it to `size` (width, height),
-    and return a cairo.ImageSurface ready to be painted.
+    and return the pixel data as a `bytes` object in Cairo ARGB32 (BGRA) format.
+    The bytes are serialized once here so that each frame only needs a single
+    cheap copy to initialize its surface.
     """
     from PIL import Image
     img = Image.open(path).convert("RGBA").resize(size, Image.LANCZOS)
     img_array = np.array(img)
     # Cairo ARGB32 stores channels as BGRA on little-endian systems
-    bgra = img_array[:, :, [2, 1, 0, 3]].copy()
-    width, height = size
-    return cairo.ImageSurface.create_for_data(bgra, cairo.FORMAT_ARGB32, width, height)
+    bgra = img_array[:, :, [2, 1, 0, 3]]
+    return bgra.tobytes()
 
 
 def draw_env(envs, out, fg_colors, bg_color, size, bg_image=None):
@@ -127,16 +128,23 @@ def draw_env(envs, out, fg_colors, bg_color, size, bg_image=None):
     Internal function, draw a single frame (two frames for stereo) using cairo and save
     it to the `out` file as png. envs is a list of envelopes over channels, each env
     is a float[bars] representing the height of the envelope to draw. Each entry will
-    be represented by a bar. If `bg_image` is a cairo.ImageSurface it is painted as the
-    background; otherwise the solid `bg_color` is used.
+    be represented by a bar. If `bg_image` is a bytes object (pre-serialized BGRA pixels
+    from load_bg_image) it is used to initialize the surface in a single copy; otherwise
+    the solid `bg_color` is used.
     """
-    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, *size)
+    width, height = size
+    if bg_image is not None:
+        # bytearray copy of the pre-serialized background initializes the surface
+        # directly — one memory copy instead of zero-fill + composite.
+        frame_data = bytearray(bg_image)
+        surface = cairo.ImageSurface.create_for_data(
+            frame_data, cairo.FORMAT_ARGB32, width, height)
+    else:
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, *size)
+
     ctx = cairo.Context(surface)
 
-    if bg_image is not None:
-        ctx.set_source_surface(bg_image, 0, 0)
-        ctx.paint()
-    else:
+    if bg_image is None:
         ctx.set_source_rgb(*bg_color)
         ctx.rectangle(0, 0, *size)
         ctx.fill()
@@ -213,10 +221,10 @@ def visualize(audio,
         fatal(err)
         raise
 
-    bg_surface = None
+    bg_pixel_data = None
     if bg_image is not None:
         try:
-            bg_surface = load_bg_image(bg_image, size)
+            bg_pixel_data = load_bg_image(bg_image, size)
         except (OSError, ValueError) as err:
             fatal(f"Could not load background image: {err}")
             raise
@@ -264,7 +272,7 @@ def visualize(audio,
             denv *= smooth
             denvs.append(denv)
         draw_env(denvs, tmp / f"{idx:06d}.png", (fg_color, fg_color2), bg_color, size,
-                 bg_image=bg_surface)
+                 bg_image=bg_pixel_data)
 
     audio_cmd = []
     if seek is not None:
