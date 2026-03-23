@@ -108,20 +108,40 @@ def envelope(wav, window, stride):
     return out
 
 
-def draw_env(envs, out, fg_colors, bg_color, size):
+def load_bg_image(path, size):
+    """
+    Load a background image from `path`, resize it to `size` (width, height),
+    and return a cairo.ImageSurface ready to be painted.
+    """
+    from PIL import Image
+    img = Image.open(path).convert("RGBA").resize(size, Image.LANCZOS)
+    img_array = np.array(img)
+    # Cairo ARGB32 stores channels as BGRA on little-endian systems
+    bgra = img_array[:, :, [2, 1, 0, 3]].copy()
+    width, height = size
+    return cairo.ImageSurface.create_for_data(bgra, cairo.FORMAT_ARGB32, width, height)
+
+
+def draw_env(envs, out, fg_colors, bg_color, size, bg_image=None):
     """
     Internal function, draw a single frame (two frames for stereo) using cairo and save
     it to the `out` file as png. envs is a list of envelopes over channels, each env
     is a float[bars] representing the height of the envelope to draw. Each entry will
-    be represented by a bar.
+    be represented by a bar. If `bg_image` is a cairo.ImageSurface it is painted as the
+    background; otherwise the solid `bg_color` is used.
     """
     surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, *size)
     ctx = cairo.Context(surface)
-    ctx.scale(*size)
 
-    ctx.set_source_rgb(*bg_color)
-    ctx.rectangle(0, 0, 1, 1)
-    ctx.fill()
+    if bg_image is not None:
+        ctx.set_source_surface(bg_image, 0, 0)
+        ctx.paint()
+    else:
+        ctx.set_source_rgb(*bg_color)
+        ctx.rectangle(0, 0, *size)
+        ctx.fill()
+
+    ctx.scale(*size)
 
     K = len(envs) # Number of waves to draw (waves are stacked vertically)
     T = len(envs[0]) # Numbert of time steps
@@ -165,6 +185,7 @@ def visualize(audio,
               fg_color=(.2, .2, .2),
               fg_color2=(.5, .3, .6),
               bg_color=(1, 1, 1),
+              bg_image=None,
               size=(400, 400),
               stereo=False,
               ):
@@ -182,6 +203,7 @@ def visualize(audio,
     `fg_color` is the rgb color to use for the foreground.
     `fg_color2` is the rgb color to use for the second wav if stereo is set.
     `bg_color` is the rgb color to use for the background.
+    `bg_image` is an optional path to an image file (e.g. JPG, PNG) to use as the background image.
     `size` is the `(width, height)` in pixels to generate.
     `stereo` is whether to create 2 waves.
     """
@@ -190,6 +212,14 @@ def visualize(audio,
     except (IOError, ValueError) as err:
         fatal(err)
         raise
+
+    bg_surface = None
+    if bg_image is not None:
+        try:
+            bg_surface = load_bg_image(bg_image, size)
+        except (OSError, ValueError) as err:
+            fatal(f"Could not load background image: {err}")
+            raise
     # wavs is a list of wav over channels
     wavs = []
     if stereo:
@@ -233,7 +263,8 @@ def visualize(audio,
             denv = (1 - w) * env1 + w * env2
             denv *= smooth
             denvs.append(denv)
-        draw_env(denvs, tmp / f"{idx:06d}.png", (fg_color, fg_color2), bg_color, size)
+        draw_env(denvs, tmp / f"{idx:06d}.png", (fg_color, fg_color2), bg_color, size,
+                 bg_image=bg_surface)
 
     audio_cmd = []
     if seek is not None:
@@ -286,6 +317,12 @@ def main():
                         help="Color of the second waveform as `r,g,b` in [0, 1] (for stereo).")
     parser.add_argument("--white", action="store_true",
                         help="Use white background. Default is black.")
+    parser.add_argument("-b",
+                        "--background",
+                        type=Path,
+                        default=None,
+                        dest="background",
+                        help="Path to an image file (JPG, PNG, etc.) to use as the video background.")
     parser.add_argument("-B",
                         "--bars",
                         type=int,
@@ -330,6 +367,7 @@ def main():
                   fg_color=args.color,
                   fg_color2=args.color2,
                   bg_color=[1. * bool(args.white)] * 3,
+                  bg_image=args.background,
                   size=(args.width, args.height),
                   stereo=args.stereo)
 
